@@ -31,6 +31,11 @@ func ErrorHandler() gin.HandlerFunc {
 			status = 404
 			code = "not_found"
 		}
-		c.JSON(status, gin.H{"error": gin.H{"code": code, "message": err.Error(), "request_id": c.GetString("request_id")}})
+		payload := gin.H{"code": code, "message": err.Error(), "request_id": c.GetString("request_id")}
+		var pending *service.PendingAnomaliesError
+		if errors.As(err, &pending) {
+			payload["pending_readings"] = pending.Pending
+		}
+		c.JSON(status, gin.H{"error": payload})
 	}
 }

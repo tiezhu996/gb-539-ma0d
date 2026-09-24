@@ -54,6 +54,10 @@ type MoistureReading struct {
 	VoidedBy       string     `json:"voided_by"`
 	VoidReason     string     `json:"void_reason"`
 	SupersedesID   string     `gorm:"index" json:"supersedes_id"`
+	ReviewState    string     `gorm:"index" json:"review_state"`
+	ReviewedBy     string     `json:"reviewed_by"`
+	ReviewedAt     *time.Time `json:"reviewed_at"`
+	ReviewReason   string     `json:"review_reason"`
 	Version        int        `gorm:"not null;default:1" json:"version"`
 }
 

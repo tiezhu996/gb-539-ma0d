@@ -51,5 +51,21 @@ current,_=call('POST','/api/v1/schedules/calculate',{'timber_lot_id':lot['id']},
 call('POST','/api/v1/schedules/'+current['id']+'/compare',{'baseline_schedule_id':schedule['id']},token=reviewer,expected=[200])
 call('GET','/api/v1/audit',token=reviewer,expected=[403])
 call('GET','/api/v1/audit',token=token,expected=[200])
+
+# Flagged readings gate simulation until a quality analyst reviews each one.
+analyst_login,_=call('POST','/api/v1/auth/login',{'email':'analyst@kilncurve.local','password':'analyst123'},expected=[200]); analyst=analyst_login['data']['token']
+flag_lot_payload=dict(lot_payload); flag_lot_payload['lot_code']='SMOKE-FLAG-'+kiln['id'][:6]
+flag_lot,_=call('POST','/api/v1/lots',flag_lot_payload,token=token,expected=[201]); flag_lot=flag_lot['data']
+flag_readings={'timber_lot_id':flag_lot['id'],'readings':[{'sample_position':'core','measured_at':measured_at,'moisture_pct':82,'dry_bulb_c':50,'wet_bulb_c':50}]}
+flagged,_=call('POST','/api/v1/readings/import',flag_readings,token=analyst,expected=[201]); flagged=flagged['data'][0]
+assert flagged['reading_quality']=='flagged' and flagged['review_state']=='pending'
+blocked,_=call('POST','/api/v1/schedules/calculate',{'timber_lot_id':flag_lot['id']},token=token,expected=[409])
+pending=blocked['error'].get('pending_readings',[])
+assert len(pending)==1 and pending[0]['reading_id']==flagged['id'] and pending[0]['quality_note'], blocked
+call('POST','/api/v1/readings/'+flagged['id']+'/review',{'decision':'adopted','reason':'工程师无权复核异常读数','version':flagged['version']},token=reviewer,expected=[403])
+call('POST','/api/v1/readings/'+flagged['id']+'/review',{'decision':'adopted','reason':'过期版本不应赢得处理','version':999},token=analyst,expected=[409])
+reviewed,_=call('POST','/api/v1/readings/'+flagged['id']+'/review',{'decision':'adopted','reason':'现场复测确认探头偏置，读数可采纳','version':flagged['version']},token=analyst,expected=[200]); reviewed=reviewed['data']
+assert reviewed['review_state']=='adopted' and reviewed['version']==flagged['version']+1
+call('POST','/api/v1/schedules/calculate',{'timber_lot_id':flag_lot['id']},token=token,expected=[201])
 print('API smoke passed')
 PY

@@ -43,6 +43,7 @@ func Mount(engine *gin.Engine, deps Dependencies) {
 	api.POST("/readings/import", middleware.Require("admin", "quality_analyst", "kiln_engineer"), deps.Readings.Import)
 	api.POST("/readings/:id/void", middleware.Require("admin", "quality_analyst"), deps.Readings.Void)
 	api.POST("/readings/:id/correct", middleware.Require("admin", "quality_analyst"), deps.Readings.Correct)
+	api.POST("/readings/:id/review", middleware.Require("admin", "quality_analyst"), deps.Readings.Review)
 	api.GET("/schedules", deps.Schedules.List)
 	api.GET("/schedules/:id", deps.Schedules.Get)
 	api.POST("/schedules/calculate", middleware.Require("admin", "quality_analyst", "kiln_engineer"), deps.Schedules.Calculate)

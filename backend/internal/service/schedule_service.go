@@ -19,6 +19,28 @@ import (
 
 const AlgorithmVersion = "curve-v2.0"
 
+// PendingReading describes one flagged sample an analyst has not handled yet.
+// It is returned to the caller when a simulation is refused so process
+// engineers can see exactly which samples block the plan and why they flagged.
+type PendingReading struct {
+	ReadingID      string    `json:"reading_id"`
+	SamplePosition string    `json:"sample_position"`
+	MeasuredAt     time.Time `json:"measured_at"`
+	MoisturePct    float64   `json:"moisture_pct"`
+	QualityNote    string    `json:"quality_note"`
+}
+
+// PendingAnomaliesError wraps ErrConflict (409) and carries the unresolved
+// flagged readings that gate the calculation.
+type PendingAnomaliesError struct {
+	Pending []PendingReading
+}
+
+func (e *PendingAnomaliesError) Error() string {
+	return fmt.Sprintf("存在 %d 条待质量分析师采纳或排除的异常读数，处理完成前不生成曲线计划", len(e.Pending))
+}
+func (e *PendingAnomaliesError) Unwrap() error { return ErrConflict }
+
 type ScheduleService struct {
 	Repo     repository.ScheduleRepository
 	Lots     repository.LotRepository
@@ -48,6 +70,15 @@ func (s ScheduleService) Calculate(ctx context.Context, input dto.ScheduleCalcul
 	}
 	if lot.LotState == constants.LotCompleted || lot.LotState == constants.LotAborted {
 		return model.DryingSchedule{}, fmt.Errorf("terminal lot cannot be calculated: %w", ErrConflict)
+	}
+	if pending, pendingErr := s.Readings.PendingReview(ctx, lot.ID); pendingErr != nil {
+		return model.DryingSchedule{}, pendingErr
+	} else if len(pending) > 0 {
+		affected := make([]PendingReading, 0, len(pending))
+		for _, item := range pending {
+			affected = append(affected, PendingReading{ReadingID: item.ID, SamplePosition: item.SamplePosition, MeasuredAt: item.MeasuredAt, MoisturePct: item.MoisturePct, QualityNote: item.QualityNote})
+		}
+		return model.DryingSchedule{}, &PendingAnomaliesError{Pending: affected}
 	}
 	kiln, err := s.Kilns.Get(ctx, lot.KilnID)
 	if err != nil {

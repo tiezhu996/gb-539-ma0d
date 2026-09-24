@@ -58,3 +58,16 @@ func (h ReadingHandler) Correct(c *gin.Context) {
 	}
 	util.Created(c, items)
 }
+
+func (h ReadingHandler) Review(c *gin.Context) {
+	var input dto.ReadingReview
+	if !bind(c, &input) {
+		return
+	}
+	item, err := h.Service.Review(c, c.Param("id"), input, actor(c), requestID(c))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	util.OK(c, item)
+}

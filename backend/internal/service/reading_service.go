@@ -170,6 +170,9 @@ func assessReadings(readings []model.MoistureReading) QualitySummary {
 	for index := range readings {
 		readings[index].ReadingQuality = assessments[index].Quality
 		readings[index].QualityNote = strings.Join(assessments[index].Reasons, "; ")
+		if assessments[index].Quality == "flagged" {
+			readings[index].ReviewState = constants.ReviewPending
+		}
 	}
 	summary := SummarizeAssessments(assessments)
 	if summary.ReviewRequired {
@@ -180,6 +183,42 @@ func assessReadings(readings []model.MoistureReading) QualitySummary {
 		}
 	}
 	return summary
+}
+
+// Review lets a quality analyst decide one flagged sample at a time. Adopted
+// samples rejoin the calculation input, excluded samples remain in history but
+// stay out of it. The conditional update plus version means two concurrent
+// analysts can never both decide the same row.
+func (s ReadingService) Review(ctx context.Context, id string, input dto.ReadingReview, actor, requestID string) (model.MoistureReading, error) {
+	reading, err := s.Repo.Get(ctx, id)
+	if err != nil {
+		return reading, ErrNotFound
+	}
+	if reading.ReadingQuality != "flagged" || (reading.ReviewState != "" && reading.ReviewState != constants.ReviewPending) {
+		return reading, ErrConflict
+	}
+	if input.Version != reading.Version {
+		return reading, ErrConflict
+	}
+	lot, err := s.Lots.Get(ctx, reading.TimberLotID)
+	if err != nil {
+		return reading, fmt.Errorf("lot: %w", ErrValidation)
+	}
+	if lot.LotState == constants.LotCompleted || lot.LotState == constants.LotAborted {
+		return reading, fmt.Errorf("cannot review reading for terminal lot: %w", ErrConflict)
+	}
+	now := time.Now().UTC()
+	before := reading
+	updated, err := s.Repo.Review(ctx, id, input.Version, input.Decision, actor, input.Reason, now)
+	if err != nil {
+		return reading, err
+	}
+	if !updated {
+		return reading, ErrConflict
+	}
+	reading.ReviewState, reading.ReviewedBy, reading.ReviewedAt, reading.ReviewReason, reading.Version = input.Decision, actor, &now, input.Reason, reading.Version+1
+	_ = s.Audit.Record(ctx, requestID, "reading", id, "review_"+input.Decision, actor, before, reading)
+	return reading, nil
 }
 
 func SummarizeAssessments(assessments []ReadingAssessment) QualitySummary {

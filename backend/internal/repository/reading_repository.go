@@ -18,15 +18,40 @@ func (r ReadingRepository) List(ctx context.Context, lotID string) ([]model.Mois
 	return items, q.Find(&items).Error
 }
 
-// Accepted returns only readings that remain eligible for a safety calculation.
-// Voided and analyst-flagged rows stay visible in List for audit purposes.
+// Accepted returns only readings that remain eligible for a safety calculation:
+// clean imports and flagged samples an analyst explicitly adopted. Voided and
+// excluded rows stay visible in List for audit purposes.
 func (r ReadingRepository) Accepted(ctx context.Context, lotID string) ([]model.MoistureReading, error) {
 	var items []model.MoistureReading
-	query := r.DB.WithContext(ctx).Where("reading_quality = ?", "accepted").Order("measured_at asc")
+	query := r.DB.WithContext(ctx).
+		Where("reading_quality = ? OR (reading_quality = ? AND review_state = ?)", "accepted", "flagged", "adopted").
+		Order("measured_at asc")
 	if lotID != "" {
 		query = query.Where("timber_lot_id = ?", lotID)
 	}
 	return items, query.Find(&items).Error
+}
+
+// PendingReview lists flagged readings an analyst has not decided on. Both the
+// empty state (imports created before the review workflow existed) and the
+// explicit "pending" state count as unhandled anomalies that gate simulation.
+func (r ReadingRepository) PendingReview(ctx context.Context, lotID string) ([]model.MoistureReading, error) {
+	var items []model.MoistureReading
+	err := r.DB.WithContext(ctx).
+		Where("timber_lot_id = ? AND reading_quality = ? AND (review_state = ? OR review_state = ?)", lotID, "flagged", "", "pending").
+		Order("measured_at asc").
+		Find(&items).Error
+	return items, err
+}
+
+// Review applies an analyst's adopt/exclude decision with an optimistic version
+// guard, so when two analysts work the same flagged row only the first commit
+// wins. An already decided row cannot be overwritten and returns no update.
+func (r ReadingRepository) Review(ctx context.Context, id string, version int, decision, actor, reason string, at time.Time) (bool, error) {
+	result := r.DB.WithContext(ctx).Model(&model.MoistureReading{}).
+		Where("id = ? AND reading_quality = ? AND (review_state = ? OR review_state = ?) AND version = ?", id, "flagged", "", "pending", version).
+		Updates(map[string]any{"review_state": decision, "reviewed_by": actor, "reviewed_at": at, "review_reason": reason, "version": version + 1})
+	return result.RowsAffected == 1, result.Error
 }
 func (r ReadingRepository) Get(ctx context.Context, id string) (model.MoistureReading, error) {
 	var item model.MoistureReading

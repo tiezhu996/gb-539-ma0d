@@ -178,3 +178,103 @@ func TestScheduleFreezeAndHistoricalComparison(t *testing.T) {
 		t.Fatalf("cross-lot comparison error = %v", err)
 	}
 }
+
+// importFlagged creates one valid but implausible reading that the import
+// assessment marks flagged and pending analyst review.
+func importFlagged(t *testing.T, ctx context.Context, lot *model.TimberLot, readings ReadingService, requestID string) model.MoistureReading {
+	t.Helper()
+	measured := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	input := dto.ReadingImport{TimberLotID: lot.ID, Readings: []dto.ReadingInput{{SamplePosition: "core", MeasuredAt: measured, MoisturePct: 82, DryBulbC: 50, WetBulbC: 50}}}
+	created, err := readings.Import(ctx, input, "analyst", requestID)
+	if err != nil || len(created) != 1 {
+		t.Fatalf("flagged import = %+v, %v", created, err)
+	}
+	if created[0].ReadingQuality != "flagged" || created[0].ReviewState != constants.ReviewPending {
+		t.Fatalf("new reading must be flagged pending review: %+v", created[0])
+	}
+	return created[0]
+}
+
+func TestScheduleBlockedUntilEveryFlaggedReadingIsReviewed(t *testing.T) {
+	ctx, _, lot, _, readings, schedules := testServices(t)
+	flagged := importFlagged(t, ctx, lot, readings, "flag-gate-1")
+
+	_, err := schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "flag-gate-2")
+	var pending *PendingAnomaliesError
+	if !errors.As(err, &pending) {
+		t.Fatalf("calculate with pending anomaly error = %v", err)
+	}
+	if len(pending.Pending) != 1 || pending.Pending[0].ReadingID != flagged.ID || pending.Pending[0].QualityNote == "" {
+		t.Fatalf("pending details = %+v", pending.Pending)
+	}
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("pending anomaly must map to conflict (409): %v", err)
+	}
+	if stored, listErr := schedules.Repo.List(ctx); listErr != nil || len(stored) != 0 {
+		t.Fatalf("refused simulation must not persist a schedule: %+v, %v", stored, listErr)
+	}
+
+	decision := dto.ReadingReview{Decision: constants.ReviewAdopted, Reason: "干球湿球传感器已现场复测，读数可接受", Version: flagged.Version}
+	adopted, err := readings.Review(ctx, flagged.ID, decision, "analyst", "flag-gate-3")
+	if err != nil || adopted.ReviewState != constants.ReviewAdopted || adopted.Version != flagged.Version+1 || adopted.ReviewedBy != "analyst" {
+		t.Fatalf("adopt review = %+v, %v", adopted, err)
+	}
+	active, err := readings.Repo.Accepted(ctx, lot.ID)
+	if err != nil || len(active) != 1 || active[0].ID != flagged.ID {
+		t.Fatalf("adopted reading must join calculation: %+v, %v", active, err)
+	}
+	plan, err := schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "flag-gate-4")
+	if err != nil || plan.ScheduleState != constants.ScheduleProposed {
+		t.Fatalf("calculation after adoption = %+v, %v", plan, err)
+	}
+}
+
+func TestReadingReviewVersionGuardLeavesOnlyFirstCommit(t *testing.T) {
+	ctx, _, lot, _, readings, _ := testServices(t)
+	flagged := importFlagged(t, ctx, lot, readings, "flag-race-1")
+
+	first := dto.ReadingReview{Decision: constants.ReviewAdopted, Reason: "现场复测确认温度探头偏置，采纳修正后的读数", Version: flagged.Version}
+	winner, err := readings.Review(ctx, flagged.ID, first, "analyst-a", "flag-race-2")
+	if err != nil || winner.ReviewState != constants.ReviewAdopted {
+		t.Fatalf("first review = %+v, %v", winner, err)
+	}
+	stale := dto.ReadingReview{Decision: constants.ReviewExcluded, Reason: "第二名分析师不应覆盖已完成的采纳结论", Version: flagged.Version}
+	if _, err := readings.Review(ctx, flagged.ID, stale, "analyst-b", "flag-race-3"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("second analyst must lose the version race: %v", err)
+	}
+	current, err := readings.Repo.Get(ctx, flagged.ID)
+	if err != nil || current.ReviewState != constants.ReviewAdopted || current.ReviewedBy != "analyst-a" {
+		t.Fatalf("only the first commit must survive: %+v, %v", current, err)
+	}
+	invalid := dto.ReadingReview{Decision: constants.ReviewAdopted, Reason: "bad", Version: winner.Version}
+	if _, err := readings.Review(ctx, flagged.ID, invalid, "analyst-a", "flag-race-4"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("reviewing an already decided reading must conflict: %v", err)
+	}
+}
+
+func TestExcludedReadingStaysVisibleButLeavesCalculation(t *testing.T) {
+	ctx, _, lot, _, readings, schedules := testServices(t)
+	flagged := importFlagged(t, ctx, lot, readings, "flag-excl-1")
+
+	decision := dto.ReadingReview{Decision: constants.ReviewExcluded, Reason: "样本位置不属受控采样点，按规程排除该读数", Version: flagged.Version}
+	excluded, err := readings.Review(ctx, flagged.ID, decision, "analyst", "flag-excl-2")
+	if err != nil || excluded.ReviewState != constants.ReviewExcluded || excluded.ReviewReason == "" {
+		t.Fatalf("exclude review = %+v, %v", excluded, err)
+	}
+	active, err := readings.Repo.Accepted(ctx, lot.ID)
+	if err != nil || len(active) != 0 {
+		t.Fatalf("excluded reading must not enter calculation: %+v, %v", active, err)
+	}
+	listed, err := readings.List(ctx, lot.ID)
+	if err != nil || len(listed) != 1 || listed[0].ID != flagged.ID {
+		t.Fatalf("excluded reading must remain in history listing: %+v, %v", listed, err)
+	}
+	pending, err := readings.Repo.PendingReview(ctx, lot.ID)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("excluded reading must no longer be pending: %+v, %v", pending, err)
+	}
+	plan, err := schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "flag-excl-3")
+	if err != nil || plan.ScheduleState != constants.ScheduleProposed {
+		t.Fatalf("calculation may proceed on lot initial moisture after exclusion: %+v, %v", plan, err)
+	}
+}

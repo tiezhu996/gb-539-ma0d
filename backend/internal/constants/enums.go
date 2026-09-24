@@ -30,6 +30,17 @@ var MoistureStages = []string{MoistureGreen, MoistureFiberSaturation, MoistureBo
 var LotStates = []string{LotQueued, LotConditioning, LotDrying, LotEqualizing, LotCompleted, LotAborted}
 var ScheduleStates = []string{ScheduleDraft, ScheduleCalculating, ScheduleProposed, ScheduleFailed, ScheduleReviewed, ScheduleAccepted, ScheduleVoided}
 
+// Analyst review states for flagged moisture readings. Pending anomalies block
+// schedule simulation; adopted rows join the calculation, excluded rows remain
+// visible history but never enter it.
+const (
+	ReviewPending  = "pending"
+	ReviewAdopted  = "adopted"
+	ReviewExcluded = "excluded"
+)
+
+var ReadingReviewStates = []string{ReviewPending, ReviewAdopted, ReviewExcluded}
+
 func ValidRole(role string) bool {
 	switch role {
 	case "admin", "kiln_engineer", "quality_analyst", "reviewer", "auditor":
