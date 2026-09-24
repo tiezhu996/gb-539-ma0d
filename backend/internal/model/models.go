@@ -53,6 +53,10 @@ type MoistureReading struct {
 	VoidedAt       *time.Time `json:"voided_at"`
 	VoidedBy       string     `json:"voided_by"`
 	VoidReason     string     `json:"void_reason"`
+	TriageDecision string     `json:"triage_decision"`
+	TriageReason   string     `json:"triage_reason"`
+	TriagedBy      string     `json:"triaged_by"`
+	TriagedAt      *time.Time `json:"triaged_at"`
 	SupersedesID   string     `gorm:"index" json:"supersedes_id"`
 	Version        int        `gorm:"not null;default:1" json:"version"`
 }

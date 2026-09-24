@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -102,6 +103,115 @@ func TestScheduleCalculationIsIdempotentAndReviewIsVersioned(t *testing.T) {
 	approved, err := schedules.Review(ctx, first.ID, constants.ScheduleAccepted, "checked", "reviewer", "s7", first.Version)
 	if err != nil || approved.ScheduleState != constants.ScheduleAccepted || approved.Version != first.Version+1 {
 		t.Fatalf("approval = %+v, %v", approved, err)
+	}
+}
+
+func TestFlaggedReadingBlocksCalculationUntilAnalystTriage(t *testing.T) {
+	ctx, _, lot, _, readings, schedules := testServices(t)
+	measured := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	flagged := dto.ReadingImport{TimberLotID: lot.ID, Readings: []dto.ReadingInput{{SamplePosition: "core", MeasuredAt: measured, MoisturePct: 3, DryBulbC: 50, WetBulbC: 49.8}}}
+	created, err := readings.Import(ctx, flagged, "analyst", "triage-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created[0].ReadingQuality != constants.ReadingFlagged {
+		t.Fatalf("expected flagged reading, got %+v", created[0])
+	}
+	if _, err = schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "triage-2"); err == nil {
+		t.Fatal("calculation must refuse lots with pending flagged readings")
+	} else {
+		if !errors.Is(err, ErrConflict) {
+			t.Fatalf("pending triage error = %v", err)
+		}
+		var pending *PendingTriageError
+		if !errors.As(err, &pending) || len(pending.Readings) != 1 || pending.Readings[0].ReadingID != created[0].ID {
+			t.Fatalf("affected readings = %+v, %v", pending, err)
+		}
+		if !strings.Contains(pending.Readings[0].QualityNote, "moisture is at an unusual operating extreme") {
+			t.Fatalf("affected reasons = %+v", pending.Readings[0])
+		}
+	}
+	if items, listErr := schedules.List(ctx); listErr != nil || len(items) != 0 {
+		t.Fatalf("no schedule may be persisted while triage is pending: %+v, %v", items, listErr)
+	}
+	adopted, err := readings.Triage(ctx, created[0].ID, dto.ReadingTriage{Decision: constants.TriageAdopted, Reason: "仪器复测确认样本有效", Version: created[0].Version}, "analyst", "triage-3")
+	if err != nil || adopted.ReadingQuality != constants.ReadingAccepted || adopted.TriagedBy != "analyst" || adopted.TriageReason == "" || adopted.Version != created[0].Version+1 {
+		t.Fatalf("adoption = %+v, %v", adopted, err)
+	}
+	if _, err = schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "triage-4"); err != nil {
+		t.Fatalf("calculation must include adopted sample: %v", err)
+	}
+}
+
+func TestExcludedReadingStaysOutOfCalculationButRemainsVisible(t *testing.T) {
+	ctx, _, lot, _, readings, schedules := testServices(t)
+	measured := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	later := time.Now().UTC().Add(-30 * time.Second).Format(time.RFC3339)
+	input := dto.ReadingImport{TimberLotID: lot.ID, Readings: []dto.ReadingInput{
+		{SamplePosition: "core", MeasuredAt: measured, MoisturePct: 44, DryBulbC: 50, WetBulbC: 44},
+		{SamplePosition: "surface", MeasuredAt: measured, MoisturePct: 43, DryBulbC: 50, WetBulbC: 44},
+		{SamplePosition: "core", MeasuredAt: later, MoisturePct: 3, DryBulbC: 50, WetBulbC: 49.8},
+	}}
+	created, err := readings.Import(ctx, input, "analyst", "exclude-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created[2].ReadingQuality != constants.ReadingFlagged {
+		t.Fatalf("expected flagged reading, got %+v", created[2])
+	}
+	if _, err = schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "exclude-2"); err == nil {
+		t.Fatal("calculation must refuse lots with pending flagged readings")
+	}
+	excluded, err := readings.Triage(ctx, created[2].ID, dto.ReadingTriage{Decision: constants.TriageExcluded, Reason: "探头结露导致读数失真", Version: created[2].Version}, "analyst", "exclude-3")
+	if err != nil || excluded.ReadingQuality != constants.ReadingExcluded {
+		t.Fatalf("exclusion = %+v, %v", excluded, err)
+	}
+	if _, err = schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "exclude-4"); err != nil {
+		t.Fatalf("calculation must proceed without excluded sample: %v", err)
+	}
+	accepted, err := readings.Repo.Accepted(ctx, lot.ID)
+	if err != nil || len(accepted) != 2 {
+		t.Fatalf("excluded sample must not participate: %+v, %v", accepted, err)
+	}
+	all, err := readings.List(ctx, lot.ID)
+	if err != nil || len(all) != 3 {
+		t.Fatalf("excluded sample must remain visible as history: %+v, %v", all, err)
+	}
+}
+
+func TestReadingTriageKeepsOnlyFirstConcurrentDecision(t *testing.T) {
+	ctx, _, lot, _, readings, _ := testServices(t)
+	measured := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	flagged := dto.ReadingImport{TimberLotID: lot.ID, Readings: []dto.ReadingInput{{SamplePosition: "core", MeasuredAt: measured, MoisturePct: 3, DryBulbC: 50, WetBulbC: 49.8}}}
+	created, err := readings.Import(ctx, flagged, "analyst-a", "race-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = readings.Triage(ctx, created[0].ID, dto.ReadingTriage{Decision: constants.TriageAdopted, Reason: "复测确认有效", Version: created[0].Version}, "analyst-a", "race-2"); err != nil {
+		t.Fatalf("first decision = %v", err)
+	}
+	if _, err = readings.Triage(ctx, created[0].ID, dto.ReadingTriage{Decision: constants.TriageExcluded, Reason: "并发处理同一记录", Version: created[0].Version}, "analyst-b", "race-3"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("second concurrent decision error = %v", err)
+	}
+	current, err := readings.Repo.Get(ctx, created[0].ID)
+	if err != nil || current.ReadingQuality != constants.ReadingAccepted || current.TriagedBy != "analyst-a" || current.Version != created[0].Version+1 {
+		t.Fatalf("only the first decision may persist: %+v, %v", current, err)
+	}
+	if _, err = readings.Triage(ctx, created[0].ID, dto.ReadingTriage{Decision: constants.TriageExcluded, Reason: "已处理记录再次处理", Version: current.Version}, "analyst-b", "race-4"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("re-triage of resolved reading error = %v", err)
+	}
+	events, err := readings.Audit.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	triaged := 0
+	for _, event := range events {
+		if event.Action == "triaged" && event.EntityID == created[0].ID {
+			triaged++
+		}
+	}
+	if triaged != 1 {
+		t.Fatalf("exactly one triage audit event expected, got %d", triaged)
 	}
 }
 

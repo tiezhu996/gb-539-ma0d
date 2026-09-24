@@ -43,6 +43,19 @@ func (h ReadingHandler) Void(c *gin.Context) {
 	util.OK(c, item)
 }
 
+func (h ReadingHandler) Triage(c *gin.Context) {
+	var input dto.ReadingTriage
+	if !bind(c, &input) {
+		return
+	}
+	item, err := h.Service.Triage(c, c.Param("id"), input, actor(c), requestID(c))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	util.OK(c, item)
+}
+
 func (h ReadingHandler) Correct(c *gin.Context) {
 	var input struct {
 		dto.ReadingImport

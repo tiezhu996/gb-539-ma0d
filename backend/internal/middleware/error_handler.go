@@ -13,6 +13,11 @@ func ErrorHandler() gin.HandlerFunc {
 			return
 		}
 		err := c.Errors.Last().Err
+		var pending *service.PendingTriageError
+		if errors.As(err, &pending) {
+			c.JSON(409, gin.H{"error": gin.H{"code": "pending_reading_triage", "message": err.Error(), "request_id": c.GetString("request_id"), "affected": pending.Readings}})
+			return
+		}
 		status := 500
 		code := "internal_error"
 		if errors.Is(err, service.ErrValidation) {

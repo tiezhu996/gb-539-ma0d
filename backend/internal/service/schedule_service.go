@@ -19,6 +19,33 @@ import (
 
 const AlgorithmVersion = "curve-v2.0"
 
+// AffectedReading identifies one flagged sample that still blocks a schedule
+// calculation, together with the reasons recorded at import.
+type AffectedReading struct {
+	ReadingID      string    `json:"reading_id"`
+	SamplePosition string    `json:"sample_position"`
+	MeasuredAt     time.Time `json:"measured_at"`
+	MoisturePct    float64   `json:"moisture_pct"`
+	QualityNote    string    `json:"quality_note"`
+}
+
+// PendingTriageError reports flagged readings that a quality analyst must
+// adopt or exclude before any new plan is generated for the lot.
+type PendingTriageError struct{ Readings []AffectedReading }
+
+func (e *PendingTriageError) Error() string {
+	return fmt.Sprintf("%d flagged readings await quality analyst triage before a schedule can be generated", len(e.Readings))
+}
+func (e *PendingTriageError) Unwrap() error { return ErrConflict }
+
+func pendingTriageError(readings []model.MoistureReading) error {
+	affected := make([]AffectedReading, 0, len(readings))
+	for _, reading := range readings {
+		affected = append(affected, AffectedReading{ReadingID: reading.ID, SamplePosition: reading.SamplePosition, MeasuredAt: reading.MeasuredAt, MoisturePct: reading.MoisturePct, QualityNote: reading.QualityNote})
+	}
+	return &PendingTriageError{Readings: affected}
+}
+
 type ScheduleService struct {
 	Repo     repository.ScheduleRepository
 	Lots     repository.LotRepository
@@ -40,7 +67,9 @@ func (s ScheduleService) Get(ctx context.Context, id string) (model.DryingSchedu
 
 // Calculate creates an immutable calculation record. The initial calculating
 // state is persisted before evaluation and conditionally advanced so concurrent
-// requests cannot overwrite a completed proposal.
+// requests cannot overwrite a completed proposal. Lots with flagged readings
+// that still await analyst triage are refused before any record is created, so
+// a plan never silently drops anomalous samples.
 func (s ScheduleService) Calculate(ctx context.Context, input dto.ScheduleCalculate, actor, requestID string) (model.DryingSchedule, error) {
 	lot, err := s.Lots.Get(ctx, input.TimberLotID)
 	if err != nil {
@@ -48,6 +77,13 @@ func (s ScheduleService) Calculate(ctx context.Context, input dto.ScheduleCalcul
 	}
 	if lot.LotState == constants.LotCompleted || lot.LotState == constants.LotAborted {
 		return model.DryingSchedule{}, fmt.Errorf("terminal lot cannot be calculated: %w", ErrConflict)
+	}
+	pending, err := s.Readings.PendingFlagged(ctx, lot.ID)
+	if err != nil {
+		return model.DryingSchedule{}, err
+	}
+	if len(pending) > 0 {
+		return model.DryingSchedule{}, pendingTriageError(pending)
 	}
 	kiln, err := s.Kilns.Get(ctx, lot.KilnID)
 	if err != nil {

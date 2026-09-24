@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"gorm.io/gorm"
+	"timber-kiln-drying-optimizer/backend/internal/constants"
 	"timber-kiln-drying-optimizer/backend/internal/model"
 	"time"
 )
@@ -19,10 +20,21 @@ func (r ReadingRepository) List(ctx context.Context, lotID string) ([]model.Mois
 }
 
 // Accepted returns only readings that remain eligible for a safety calculation.
-// Voided and analyst-flagged rows stay visible in List for audit purposes.
+// Voided, excluded and analyst-flagged rows stay visible in List for audit
+// purposes; flagged rows additionally block new calculations until triaged.
 func (r ReadingRepository) Accepted(ctx context.Context, lotID string) ([]model.MoistureReading, error) {
 	var items []model.MoistureReading
-	query := r.DB.WithContext(ctx).Where("reading_quality = ?", "accepted").Order("measured_at asc")
+	query := r.DB.WithContext(ctx).Where("reading_quality = ?", constants.ReadingAccepted).Order("measured_at asc")
+	if lotID != "" {
+		query = query.Where("timber_lot_id = ?", lotID)
+	}
+	return items, query.Find(&items).Error
+}
+
+// PendingFlagged lists anomalies that still wait for an analyst decision.
+func (r ReadingRepository) PendingFlagged(ctx context.Context, lotID string) ([]model.MoistureReading, error) {
+	var items []model.MoistureReading
+	query := r.DB.WithContext(ctx).Where("reading_quality = ?", constants.ReadingFlagged).Order("measured_at asc")
 	if lotID != "" {
 		query = query.Where("timber_lot_id = ?", lotID)
 	}
@@ -53,7 +65,7 @@ func (r ReadingRepository) ExistsChecksum(ctx context.Context, lotID, checksum s
 func (r ReadingRepository) ExistsChecksumWithDB(ctx context.Context, db *gorm.DB, lotID, checksum string) (bool, error) {
 	var count int64
 	err := db.WithContext(ctx).Model(&model.MoistureReading{}).
-		Where("timber_lot_id = ? AND source_checksum = ? AND reading_quality <> ?", lotID, checksum, "voided").Count(&count).Error
+		Where("timber_lot_id = ? AND source_checksum = ? AND reading_quality <> ?", lotID, checksum, constants.ReadingVoided).Count(&count).Error
 	return count > 0, err
 }
 func (r ReadingRepository) Delete(ctx context.Context, id string) error {
@@ -66,7 +78,17 @@ func (r ReadingRepository) Void(ctx context.Context, id string, version int, act
 
 func (r ReadingRepository) VoidWithDB(ctx context.Context, db *gorm.DB, id string, version int, actor, reason string, at time.Time) (bool, error) {
 	result := db.WithContext(ctx).Model(&model.MoistureReading{}).
-		Where("id = ? AND reading_quality = ? AND version = ?", id, "accepted", version).
-		Updates(map[string]any{"reading_quality": "voided", "voided_at": at, "voided_by": actor, "void_reason": reason, "version": version + 1})
+		Where("id = ? AND reading_quality = ? AND version = ?", id, constants.ReadingAccepted, version).
+		Updates(map[string]any{"reading_quality": constants.ReadingVoided, "voided_at": at, "voided_by": actor, "void_reason": reason, "version": version + 1})
+	return result.RowsAffected == 1, result.Error
+}
+
+// Triage resolves a flagged reading exactly once. The flagged-and-version
+// predicate keeps only the first of two concurrent analyst decisions; the
+// slower request updates zero rows and surfaces a conflict.
+func (r ReadingRepository) Triage(ctx context.Context, id string, version int, quality, decision, actor, reason string, at time.Time) (bool, error) {
+	result := r.DB.WithContext(ctx).Model(&model.MoistureReading{}).
+		Where("id = ? AND reading_quality = ? AND version = ?", id, constants.ReadingFlagged, version).
+		Updates(map[string]any{"reading_quality": quality, "triage_decision": decision, "triage_reason": reason, "triaged_by": actor, "triaged_at": at, "version": version + 1})
 	return result.RowsAffected == 1, result.Error
 }

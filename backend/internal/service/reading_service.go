@@ -46,7 +46,7 @@ func (s ReadingService) Void(ctx context.Context, id string, input dto.ReadingVo
 	if err != nil {
 		return reading, ErrNotFound
 	}
-	if input.Version != reading.Version || reading.ReadingQuality != "accepted" {
+	if input.Version != reading.Version || reading.ReadingQuality != constants.ReadingAccepted {
 		return reading, ErrConflict
 	}
 	lot, err := s.Lots.Get(ctx, reading.TimberLotID)
@@ -65,8 +65,45 @@ func (s ReadingService) Void(ctx context.Context, id string, input dto.ReadingVo
 	if !updated {
 		return reading, ErrConflict
 	}
-	reading.ReadingQuality, reading.VoidedAt, reading.VoidedBy, reading.VoidReason, reading.Version = "voided", &now, actor, input.Reason, reading.Version+1
+	reading.ReadingQuality, reading.VoidedAt, reading.VoidedBy, reading.VoidReason, reading.Version = constants.ReadingVoided, &now, actor, input.Reason, reading.Version+1
 	_ = s.Audit.Record(ctx, requestID, "reading", id, "voided", actor, before, reading)
+	return reading, nil
+}
+
+// Triage lets a quality analyst adopt or exclude one flagged reading with a
+// written reason. Adopted rows join schedule calculations; excluded rows stay
+// as readable history but never enter the safety envelope. The versioned conditional
+// update keeps only the first of two concurrent analyst decisions.
+func (s ReadingService) Triage(ctx context.Context, id string, input dto.ReadingTriage, actor, requestID string) (model.MoistureReading, error) {
+	reading, err := s.Repo.Get(ctx, id)
+	if err != nil {
+		return reading, ErrNotFound
+	}
+	if reading.ReadingQuality != constants.ReadingFlagged || input.Version != reading.Version {
+		return reading, ErrConflict
+	}
+	lot, err := s.Lots.Get(ctx, reading.TimberLotID)
+	if err != nil {
+		return reading, fmt.Errorf("lot: %w", ErrValidation)
+	}
+	if lot.LotState == constants.LotCompleted || lot.LotState == constants.LotAborted {
+		return reading, fmt.Errorf("cannot triage reading for terminal lot: %w", ErrConflict)
+	}
+	quality := constants.ReadingExcluded
+	if input.Decision == constants.TriageAdopted {
+		quality = constants.ReadingAccepted
+	}
+	before := reading
+	now := time.Now().UTC()
+	updated, err := s.Repo.Triage(ctx, id, input.Version, quality, input.Decision, actor, input.Reason, now)
+	if err != nil {
+		return reading, err
+	}
+	if !updated {
+		return reading, ErrConflict
+	}
+	reading.ReadingQuality, reading.TriageDecision, reading.TriageReason, reading.TriagedBy, reading.TriagedAt, reading.Version = quality, input.Decision, input.Reason, actor, &now, reading.Version+1
+	_ = s.Audit.Record(ctx, requestID, "reading", id, "triaged", actor, before, reading)
 	return reading, nil
 }
 
@@ -119,7 +156,7 @@ func (s ReadingService) Correct(ctx context.Context, id string, input dto.Readin
 		return nil, err
 	}
 	voided := current
-	voided.ReadingQuality, voided.VoidedAt, voided.VoidedBy, voided.VoidReason, voided.Version = "voided", &now, actor, "replaced by corrected import", version+1
+	voided.ReadingQuality, voided.VoidedAt, voided.VoidedBy, voided.VoidReason, voided.Version = constants.ReadingVoided, &now, actor, "replaced by corrected import", version+1
 	_ = s.Audit.Record(ctx, requestID, "reading", current.ID, "corrected", actor, current, struct {
 		Voided       model.MoistureReading
 		Replacements []model.MoistureReading
@@ -174,7 +211,7 @@ func assessReadings(readings []model.MoistureReading) QualitySummary {
 	summary := SummarizeAssessments(assessments)
 	if summary.ReviewRequired {
 		for index := range readings {
-			if readings[index].ReadingQuality == "accepted" {
+			if readings[index].ReadingQuality == constants.ReadingAccepted {
 				readings[index].QualityNote += "; batch contains flagged samples and requires analyst review"
 			}
 		}
@@ -190,7 +227,7 @@ func SummarizeAssessments(assessments []ReadingAssessment) QualitySummary {
 	seen := map[string]bool{}
 	for _, assessment := range assessments {
 		summary.AverageScore += float64(assessment.Score)
-		if assessment.Quality == "flagged" {
+		if assessment.Quality == constants.ReadingFlagged {
 			summary.Flagged++
 			summary.ReviewRequired = true
 		} else {
@@ -209,11 +246,12 @@ func SummarizeAssessments(assessments []ReadingAssessment) QualitySummary {
 }
 
 // AssessBatch records explainable data quality, while retaining flagged input
-// for traceability. Safety calculation later treats flagged rows as anomalies.
+// for traceability. Flagged rows block safety calculations until an analyst
+// adopts or excludes each of them.
 func AssessBatch(readings []model.MoistureReading) []ReadingAssessment {
 	results := make([]ReadingAssessment, len(readings))
 	for index, reading := range readings {
-		assessment := ReadingAssessment{ReadingID: reading.ID, Quality: "accepted", Score: 100}
+		assessment := ReadingAssessment{ReadingID: reading.ID, Quality: constants.ReadingAccepted, Score: 100}
 		if reading.DryBulbC-reading.WetBulbC < 0.5 {
 			assessment.Score -= 30
 			assessment.Reasons = append(assessment.Reasons, "dry and wet bulb separation is implausibly small")
@@ -242,7 +280,7 @@ func AssessBatch(readings []model.MoistureReading) []ReadingAssessment {
 			}
 		}
 		if assessment.Score < 70 {
-			assessment.Quality, assessment.RequireReview = "flagged", true
+			assessment.Quality, assessment.RequireReview = constants.ReadingFlagged, true
 		}
 		if len(assessment.Reasons) == 0 {
 			assessment.Reasons = []string{"within import plausibility checks"}
@@ -295,7 +333,7 @@ func prepareReadings(lot model.TimberLot, input dto.ReadingImport, actor string,
 			return nil, fmt.Errorf("duplicate reading content: %w", ErrValidation)
 		}
 		seenChecksums[checksum] = struct{}{}
-		created = append(created, model.MoistureReading{ID: util.ID(), TimberLotID: lot.ID, SamplePosition: position, MeasuredAt: measuredAt, MoisturePct: row.MoisturePct, DryBulbC: row.DryBulbC, WetBulbC: row.WetBulbC, ReadingQuality: "accepted", ImportedBy: actor, SourceChecksum: checksum, SupersedesID: row.SupersedesID, Version: 1})
+		created = append(created, model.MoistureReading{ID: util.ID(), TimberLotID: lot.ID, SamplePosition: position, MeasuredAt: measuredAt, MoisturePct: row.MoisturePct, DryBulbC: row.DryBulbC, WetBulbC: row.WetBulbC, ReadingQuality: constants.ReadingAccepted, ImportedBy: actor, SourceChecksum: checksum, SupersedesID: row.SupersedesID, Version: 1})
 	}
 	return created, nil
 }

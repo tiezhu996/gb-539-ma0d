@@ -26,6 +26,18 @@ const (
 	ScheduleVoided      = "voided"
 )
 
+const (
+	ReadingAccepted = "accepted"
+	ReadingFlagged  = "flagged"
+	ReadingExcluded = "excluded"
+	ReadingVoided   = "voided"
+)
+
+const (
+	TriageAdopted  = "adopted"
+	TriageExcluded = "excluded"
+)
+
 var MoistureStages = []string{MoistureGreen, MoistureFiberSaturation, MoistureBoundWater, MoistureTarget}
 var LotStates = []string{LotQueued, LotConditioning, LotDrying, LotEqualizing, LotCompleted, LotAborted}
 var ScheduleStates = []string{ScheduleDraft, ScheduleCalculating, ScheduleProposed, ScheduleFailed, ScheduleReviewed, ScheduleAccepted, ScheduleVoided}
